@@ -49,6 +49,8 @@ async def full_echo(name, max_size=65507, delay_ms=0, down=False):
             app=echo_app,
             cfg=echo_app.state.cfg,
             stats=echo_app.state.stats,
+            threshold=echo_app.state.threshold,
+            fault=echo_app.state.fault,
             udp_port=echo_app.state.udp_port,
             http_port=http_port,
             ctrl_url=f"http://127.0.0.1:{http_port}",

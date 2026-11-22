@@ -5,13 +5,16 @@
 #
 # 线路 a：窄线，超过 1500 字节的包丢弃，回包延迟 30ms
 # 线路 b：宽线，超过 4000 字节的包丢弃，回包延迟 80ms
-# 运行中可用 POST /api/lines/{name}/config 改参数（超长丢包/延迟/断线）。
+# 运行中可用 POST /api/lines/{name}/config 改参数（超长丢包/延迟/断线）；
+# 改阈值会立即撤下旧建议并作废改动前启动的测量。
 
 services:
   echo-a:
     build: .
     image: udp-line-measure
     command: ["python", "-m", "echo.server"]
+    ports:
+      - "9101:9101"   # 控制口暴露到宿主机，便于 /docs 之外的故障注入自测
     environment:
       LINE_NAME: a
       UDP_PORT: "9001"
@@ -23,6 +26,8 @@ services:
     build: .
     image: udp-line-measure
     command: ["python", "-m", "echo.server"]
+    ports:
+      - "9102:9102"
     environment:
       LINE_NAME: b
       UDP_PORT: "9002"

@@ -6,6 +6,9 @@
 - 断线：``down`` 为真时丢弃所有包。
 
 行为以**收到包那一刻**的配置为准（延迟期间改配置不影响已入队的包）。
+
+``threshold_version`` 是**实际生效的阈值版本**：只有 ``max_size`` 真的发生变化才 +1，
+把阈值改回原值也会继续 +1。主服务据此判断“阈值是否实际变过”，而不只是比较当前值。
 运行方式：``python -m echo.server``（参数走环境变量，见文件底部 main）。
 """
 from __future__ import annotations
@@ -26,6 +29,13 @@ class LineConfig:
     max_size: int = MAX_UDP_PAYLOAD  # 超过即丢（模拟超长丢包）
     delay_ms: int = 0                # 回包延迟
     down: bool = False               # 断线
+
+
+@dataclass
+class ThresholdState:
+    """阈值版本：``max_size`` 每次实际变化（含改回原值）都会 +1。"""
+
+    version: int = 0
 
 
 @dataclass
@@ -74,6 +84,15 @@ class ConfigPatch(BaseModel):
     down: bool | None = None
 
 
+class FaultPatch(BaseModel):
+    """自测用的控制面故障注入（不影响 UDP 回显本身）。"""
+
+    #: POST /config 先真实生效，再延迟这么久才回包 → 调用方会超时。
+    post_applies_then_delay_ms: int = Field(default=0, ge=0, le=60_000)
+    #: GET /config 延迟回包（模拟控制口读取超时/不可达）。
+    get_delay_ms: int = Field(default=0, ge=0, le=60_000)
+
+
 def create_echo_app(
     line_name: str,
     udp_host: str,
@@ -85,6 +104,8 @@ def create_echo_app(
     """构造一条回显线路：控制口随 HTTP 服务启动，UDP 口在 lifespan 内绑定。"""
     cfg = LineConfig(max_size=max_size, delay_ms=delay_ms, down=down)
     stats = LineStats()
+    threshold = ThresholdState()
+    fault = FaultPatch()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -101,7 +122,25 @@ def create_echo_app(
     app = FastAPI(title=f"回显线路 {line_name}", lifespan=lifespan)
     app.state.cfg = cfg
     app.state.stats = stats
+    app.state.threshold = threshold
+    app.state.fault = fault
     app.state.line_name = line_name
+
+    def config_view() -> dict:
+        return {
+            "line": line_name,
+            **asdict(cfg),
+            "threshold_version": threshold.version,
+        }
+
+    def apply_patch(patch: ConfigPatch) -> dict:
+        values = patch.model_dump(exclude_none=True)
+        # 只有阈值“实际变过”才推进版本；改回原值同样算变过。
+        if "max_size" in values and values["max_size"] != cfg.max_size:
+            threshold.version += 1
+        for key, value in values.items():
+            setattr(cfg, key, value)
+        return config_view()
 
     @app.get("/health")
     async def health() -> dict:
@@ -109,13 +148,27 @@ def create_echo_app(
 
     @app.get("/config")
     async def get_config() -> dict:
-        return {"line": line_name, **asdict(cfg)}
+        if fault.get_delay_ms:
+            await asyncio.sleep(fault.get_delay_ms / 1000)
+        return config_view()
 
     @app.post("/config")
     async def set_config(patch: ConfigPatch) -> dict:
+        view = apply_patch(patch)
+        # 自测：配置已真实生效，但响应被拖到调用方超时之后才返回。
+        if fault.post_applies_then_delay_ms:
+            await asyncio.sleep(fault.post_applies_then_delay_ms / 1000)
+        return view
+
+    @app.get("/fault")
+    async def get_fault() -> dict:
+        return {"line": line_name, **fault.model_dump()}
+
+    @app.post("/fault")
+    async def set_fault(patch: FaultPatch) -> dict:
         for key, value in patch.model_dump(exclude_none=True).items():
-            setattr(cfg, key, value)
-        return {"line": line_name, **asdict(cfg)}
+            setattr(fault, key, value)
+        return {"line": line_name, **fault.model_dump()}
 
     @app.get("/stats")
     async def get_stats() -> dict:

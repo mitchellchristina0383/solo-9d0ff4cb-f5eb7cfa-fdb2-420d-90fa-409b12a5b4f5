@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field, model_validator
 
 from .config import MAX_UDP_PAYLOAD, LineEndpoint, load_lines
 from .state import (
+    ConfigRejected,
+    ConfigUnconfirmed,
     LineManager,
     Measurement,
     MeasurementBusy,
@@ -56,6 +58,7 @@ def measurement_view(rec: Measurement) -> dict:
         "id": rec.id,
         "line": rec.line,
         "epoch": rec.epoch,
+        "generation": rec.generation,
         "range": {"lower": rec.lower, "upper": rec.upper},
         "timeout_ms": rec.timeout_ms,
         "attempts": rec.attempts,
@@ -63,6 +66,7 @@ def measurement_view(rec: Measurement) -> dict:
         "max_payload": rec.max_payload,
         "probes_sent": rec.probes_sent,
         "published": rec.published,
+        "baseline_known": rec.baseline_known,
         "detail": rec.detail,
         "started_at": rec.started_at,
         "finished_at": rec.finished_at,
@@ -70,11 +74,14 @@ def measurement_view(rec: Measurement) -> dict:
     }
 
 
-def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
+def create_app(
+    lines: dict[str, LineEndpoint] | None = None,
+    http_timeout: float = 3.0,
+) -> FastAPI:
     endpoints = lines or load_lines()
-    manager = LineManager(endpoints)
+    http = httpx.AsyncClient(timeout=http_timeout)
+    manager = LineManager(endpoints, http=http)
     service = MeasurementService(manager)
-    http = httpx.AsyncClient(timeout=3.0)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -96,6 +103,7 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
 
     @app.get("/", summary="服务概览")
     async def root() -> dict:
+        await manager.reconcile_unconfirmed()
         return {
             "service": "UDP 线路载荷测量服务",
             "docs": "/docs",
@@ -126,10 +134,13 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
 
     @app.get("/api/recommendation", summary="当前建议")
     async def get_recommendation() -> dict:
+        # 配置结果未确认的线路：先尝试与回显端核实，确认阈值没变则原建议恢复可用。
+        await manager.reconcile_unconfirmed()
         return manager.snapshot()
 
     @app.get("/api/line", summary="当前线路状态")
     async def get_line() -> dict:
+        await manager.reconcile_unconfirmed()
         return manager.snapshot()
 
     @app.post("/api/line/switch", summary="切线（立即撤下旧建议）")
@@ -154,11 +165,15 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
             )
             cfg_resp.raise_for_status()
             stats_resp.raise_for_status()
+            config = cfg_resp.json()
+            # 顺带核对：若回显端阈值在此期间被外部改动，也能及时发现并撤旧建议。
+            await manager.observe_config(name, config)
             return {
                 **base,
                 "reachable": True,
-                "config": cfg_resp.json(),
+                "config": config,
                 "stats": stats_resp.json(),
+                "config_state": manager.config_state(name).view(),
             }
         except Exception as exc:  # noqa: BLE001 - 线路控制口不可达也要能展示
             return {**base, "reachable": False, "error": str(exc)}
@@ -171,23 +186,23 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
 
     @app.post("/api/lines/{name}/config", summary="调整线路模拟参数")
     async def set_line_config(name: str, patch: LineConfigPatch) -> dict:
-        ep = manager.lines.get(name)
-        if ep is None:
+        if name not in manager.lines:
             raise HTTPException(
                 status_code=404,
                 detail=f"未知线路 {name!r}，可选: {sorted(manager.lines)}",
             )
         try:
-            resp = await http.post(
-                f"{ep.ctrl_url}/config",
-                json=patch.model_dump(exclude_none=True),
+            return await manager.configure(
+                name, patch.model_dump(exclude_none=True)
             )
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"线路控制口不可达: {exc}")
-        return resp.json()
+        except ConfigRejected as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc))
+        except ConfigUnconfirmed as exc:
+            # 503：配置结果无法核实，该线路已暂停提供/发布建议，需重试或人工确认。
+            raise HTTPException(
+                status_code=503,
+                detail={"message": str(exc), "line_state": exc.state},
+            )
 
     return app
 
